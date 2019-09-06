@@ -39,6 +39,10 @@ import org.eclipse.jetty.server.handler.RequestLogHandler;
 import org.eclipse.jetty.util.component.AbstractLifeCycle;
 import org.eclipse.jetty.util.log.Log;
 import org.eclipse.jetty.util.log.Logger;
+import org.eclipse.jetty.util.preventers.AppContextLeakPreventer;
+import org.eclipse.jetty.util.preventers.DOMLeakPreventer;
+import org.eclipse.jetty.util.preventers.GCThreadLeakPreventer;
+import org.eclipse.jetty.util.preventers.SecurityProviderLeakPreventer;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.eclipse.jetty.webapp.ClasspathPattern;
 import org.eclipse.jetty.webapp.Configuration;
@@ -56,10 +60,6 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.Iterator;
 import java.util.List;
-
-import javax.imageio.ImageIO;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.parsers.ParserConfigurationException;
 
 /**
  * A {@link ServletContainerLauncher} for an embedded Jetty server.
@@ -127,7 +127,7 @@ public class JettyLauncher extends ServletContainerLauncher {
       }
       if (logger.isLoggable(logStatus)) {
         TreeLogger branch = logger.branch(logStatus, String.valueOf(status)
-            + " - " + request.getMethod() + ' ' + request.getUri() + " ("
+            + " - " + request.getMethod() + ' ' + request.getRequestURI() + " ("
             + userString + request.getRemoteHost() + ')' + bytesString);
         if (branch.isLoggable(logHeaders)) {
           logHeaders(branch.branch(logHeaders, "Request headers"), logHeaders,
@@ -365,17 +365,20 @@ public class JettyLauncher extends ServletContainerLauncher {
           "javax.xml.", // Used by Jetty for jetty-web.xml parsing
       });
 
+      private WebAppContext _contextExt;
+
       public WebAppClassLoaderExtension() throws IOException {
         super(bootStrapOnlyClassLoader, WebAppContextWithReload.this);
+        _contextExt = WebAppContextWithReload.this;
       }
 
       @Override
       public Enumeration<URL> getResources(String name) throws IOException {
         // Logic copied from Jetty's WebAppClassLoader
-        List<URL> fromParent = isServerClass(name)
+        List<URL> fromParent = _contextExt.isServerClass(name)
             ? Collections.<URL>emptyList()
             : Lists.newArrayList(Iterators.forEnumeration(systemClassLoader.getResources(name)));
-        Iterator<URL> fromWebapp = isSystemClass(name) && !fromParent.isEmpty()
+        Iterator<URL> fromWebapp = _contextExt.isSystemClass(name) && !fromParent.isEmpty()
             ? Collections.<URL>emptyIterator()
             : Iterators.forEnumeration(findResources(name));
         return Iterators.asEnumeration(Iterators.concat(fromWebapp, fromParent.iterator()));
@@ -394,7 +397,7 @@ public class JettyLauncher extends ServletContainerLauncher {
         // Note: bootstrap has already been searched, so javax. classes should be
         // tried from the webapp first (except for javax.servlet and javax.el).
         URL found;
-        if (isSystemClass(checkName) && !systemClassesFromWebappFirst.match(checkName)) {
+        if (_contextExt.isSystemClass(checkName) && !systemClassesFromWebappFirst.match(checkName)) {
           found = systemClassLoader.getResource(name);
           if (found != null) {
             return found;
@@ -409,7 +412,7 @@ public class JettyLauncher extends ServletContainerLauncher {
 
         // See if the outside world has it.
         found = systemClassLoader.getResource(name);
-        if (found == null || isServerClass(checkName)) {
+        if (found == null || _contextExt.isServerClass(checkName)) {
           return null;
         }
 
@@ -435,7 +438,7 @@ public class JettyLauncher extends ServletContainerLauncher {
         // For system path, always prefer the outside world.
         // Note: bootstrap has already been searched, so javax. classes should be
         // tried from the webapp first (except for javax.servlet).
-        if (isSystemClass(name) && !systemClassesFromWebappFirst.match(name)) {
+        if (_contextExt.isSystemClass(name) && !systemClassesFromWebappFirst.match(name)) {
           try {
             return systemClassLoader.loadClass(name);
           } catch (ClassNotFoundException e) {
@@ -446,7 +449,7 @@ public class JettyLauncher extends ServletContainerLauncher {
           return super.findClass(name);
         } catch (ClassNotFoundException e) {
           // Don't allow server classes to be loaded from the outside.
-          if (isServerClass(name)) {
+          if (_contextExt.isServerClass(name)) {
             throw e;
           }
         }
@@ -520,7 +523,7 @@ public class JettyLauncher extends ServletContainerLauncher {
      * classes. We would just use <code>null</code> for the parent ClassLoader
      * except this makes Jetty unhappy.
      */
-    private final ClassLoader bootStrapOnlyClassLoader = new ClassLoader(null) {
+    private final ClassLoader bootStrapOnlyClassLoader = new ClassLoader(ClassLoader.getPlatformClassLoader()) {
     };
 
     private final TreeLogger logger;
@@ -729,6 +732,7 @@ public class JettyLauncher extends ServletContainerLauncher {
     ServerConnector connector = getConnector(server, logger);
     setupConnector(connector, bindAddress, port);
     server.addConnector(connector);
+    addPreventers(server);
 
     Configuration.ClassList cl = Configuration.ClassList.setServerDefault(server);
     try {
@@ -751,7 +755,7 @@ public class JettyLauncher extends ServletContainerLauncher {
     }
 
     // Create a new web app in the war directory.
-      WebAppContext wac = createWebAppContext(logger, appRootDir);
+    WebAppContext wac = createWebAppContext(logger, appRootDir);
 
     RequestLogHandler logHandler = new RequestLogHandler();
     logHandler.setRequestLog(new JettyRequestLogger(logger, getBaseLogLevel()));
@@ -787,11 +791,12 @@ public class JettyLauncher extends ServletContainerLauncher {
         "org.eclipse.jetty.webapp.WebXmlConfiguration",
         "org.eclipse.jetty.webapp.MetaInfConfiguration",
         "org.eclipse.jetty.webapp.FragmentConfiguration",
-        "org.eclipse.jetty.plus.webapp.EnvConfiguration",
-        "org.eclipse.jetty.plus.webapp.PlusConfiguration",
+//        "org.eclipse.jetty.plus.webapp.EnvConfiguration",
+//        "org.eclipse.jetty.plus.webapp.PlusConfiguration",
         "org.eclipse.jetty.annotations.AnnotationConfiguration",
         "org.eclipse.jetty.webapp.JettyWebXmlConfiguration"
     });
+
     return context;
   }
 
@@ -843,6 +848,37 @@ public class JettyLauncher extends ServletContainerLauncher {
      return config;
   }
 
+  private void addPreventers(Server server) {
+    // Trigger a call to sun.awt.AppContext.getAppContext(). This will
+    // pin the common class loader in memory but that shouldn't be an
+    // issue.
+    server.addBean(new AppContextLeakPreventer());
+
+    /*
+     * Several components end up calling: sun.misc.GC.requestLatency(long)
+     *
+     * Those libraries / components known to trigger memory leaks due to
+     * eventual calls to requestLatency(long) are:
+     * - javax.management.remote.rmi.RMIConnectorServer.start()
+     */
+    server.addBean(new GCThreadLeakPreventer());
+
+    /*
+     * Creating a MessageDigest during web application startup initializes the
+     * Java Cryptography Architecture. Under certain conditions this starts a
+     * Token poller thread with TCCL equal to the web application class loader.
+     *
+     * Instead we initialize JCA right now.
+     */
+    server.addBean(new SecurityProviderLeakPreventer());
+
+    /*
+     * Haven't got to the root of what is going on with this leak but if a web app is the first to
+     * make the calls below the web application class loader will be pinned in memory.
+     */
+    server.addBean(new DOMLeakPreventer());
+  }
+
   private void checkStartParams(TreeLogger logger, int port, File appRootDir) {
     if (logger == null) {
       throw new NullPointerException("logger cannot be null");
@@ -883,37 +919,6 @@ public class JettyLauncher extends ServletContainerLauncher {
    * (http://www.apache.org/).
    */
   private void jreLeakPrevention(TreeLogger logger) {
-    // Trigger a call to sun.awt.AppContext.getAppContext(). This will
-    // pin the common class loader in memory but that shouldn't be an
-    // issue.
-    ImageIO.getCacheDirectory();
-
-    /*
-     * Several components end up calling: sun.misc.GC.requestLatency(long)
-     *
-     * Those libraries / components known to trigger memory leaks due to
-     * eventual calls to requestLatency(long) are: -
-     * javax.management.remote.rmi.RMIConnectorServer.start()
-     */
-    try {
-      Class<?> clazz = Class.forName("sun.misc.GC");
-      Method method = clazz.getDeclaredMethod("requestLatency",
-          new Class[]{long.class});
-      method.invoke(null, Long.valueOf(3600000));
-    } catch (ClassNotFoundException e) {
-      logger.log(TreeLogger.ERROR, "jreLeakPrevention.gcDaemonFail", e);
-    } catch (SecurityException e) {
-      logger.log(TreeLogger.ERROR, "jreLeakPrevention.gcDaemonFail", e);
-    } catch (NoSuchMethodException e) {
-      logger.log(TreeLogger.ERROR, "jreLeakPrevention.gcDaemonFail", e);
-    } catch (IllegalArgumentException e) {
-      logger.log(TreeLogger.ERROR, "jreLeakPrevention.gcDaemonFail", e);
-    } catch (IllegalAccessException e) {
-      logger.log(TreeLogger.ERROR, "jreLeakPrevention.gcDaemonFail", e);
-    } catch (InvocationTargetException e) {
-      logger.log(TreeLogger.ERROR, "jreLeakPrevention.gcDaemonFail", e);
-    }
-
     /*
      * Calling getPolicy retains a static reference to the context class loader.
      */
@@ -938,15 +943,6 @@ public class JettyLauncher extends ServletContainerLauncher {
     }
 
     /*
-     * Creating a MessageDigest during web application startup initializes the
-     * Java Cryptography Architecture. Under certain conditions this starts a
-     * Token poller thread with TCCL equal to the web application class loader.
-     *
-     * Instead we initialize JCA right now.
-     */
-    java.security.Security.getProviders();
-
-    /*
      * Several components end up opening JarURLConnections without first
      * disabling caching. This effectively locks the file. Whilst more
      * noticeable and harder to ignore on Windows, it affects all operating
@@ -967,18 +963,6 @@ public class JettyLauncher extends ServletContainerLauncher {
       logger.log(TreeLogger.ERROR, "jreLeakPrevention.jarUrlConnCacheFail", e);
     } catch (IOException e) {
       logger.log(TreeLogger.ERROR, "jreLeakPrevention.jarUrlConnCacheFail", e);
-    }
-
-    /*
-     * Haven't got to the root of what is going on with this leak but if a web
-     * app is the first to make the calls below the web application class loader
-     * will be pinned in memory.
-     */
-    DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
-    try {
-      factory.newDocumentBuilder();
-    } catch (ParserConfigurationException e) {
-      logger.log(TreeLogger.ERROR, "jreLeakPrevention.xmlParseFail", e);
     }
   }
 }
