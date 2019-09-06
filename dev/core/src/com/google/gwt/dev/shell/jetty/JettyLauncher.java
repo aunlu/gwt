@@ -523,8 +523,7 @@ public class JettyLauncher extends ServletContainerLauncher {
      * classes. We would just use <code>null</code> for the parent ClassLoader
      * except this makes Jetty unhappy.
      */
-    private final ClassLoader bootStrapOnlyClassLoader = new ClassLoader(ClassLoader.getPlatformClassLoader()) {
-    };
+    private final ClassLoader bootStrapOnlyClassLoader = new ClassLoader() {};
 
     private final TreeLogger logger;
 
